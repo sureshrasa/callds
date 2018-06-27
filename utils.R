@@ -47,7 +47,7 @@ loadNumberingPlan <- function(filename)
   print(sprintf("Unprocessed rows = %d", nrow(dt)))
   
   result$operator = as.character(result$`Communications Provider`)
-  return (mutate(result[,c("prefix", "operator")], "org"="Ofcom"))
+  return (mutate(result[,c("prefix", "operator")], org="Ofcom"))
 }
 
 loadAllNumberingPlans <- function()
@@ -89,19 +89,28 @@ buildGroupCodes <- function(idc, countryCode, telPattern, telReplacement)
 loadInternationalDiallingCodes <- function()
 {
   #See https://www.aggdata.com/free/international-calling-codes
-  idc = read.csv("~/Downloads/globalareacodes.csv",header = TRUE, stringsAsFactors = FALSE)
-  
+  idc = read.csv("~/Downloads/globalareacodes.csv",header = TRUE, stringsAsFactors = FALSE) %>%
+    group_by(Country.Code, Country) %>%
+    mutate(totalByCountry=n()) %>%
+    ungroup() %>%
+    group_by(Country.Code) %>%
+    mutate(totalByCode=n()) %>%
+    ungroup()
+    
   idc$Area.Code[idc$Area.Code=="684"] = "(1+)684"
   idc$Area.Code[idc$Area.Code=="(1)649"] = "(1+)649"
   
-  nonNorthAmerica = idc %>%
-    select("Country", "Country.Code") %>%
+  # Compute all non grouped ITU numbering plans
+  df = idc %>%
+    filter(totalByCountry==totalByCode) %>%
+    select(Country, Country.Code) %>%
     distinct() %>%
-    filter(!(Country.Code %in% c(1, 7, 212, 252, 262, 269, 290, 34, 358, 39, 44, 47, 61, 672, 90)))
+    rename("operator"=Country, "prefix"=Country.Code)
   
-  nonNorthAmerica$Country.Code = paste("+", as.character(nonNorthAmerica$Country.Code), sep = "")
-  
-  df = buildGroupCodes(idc, 1, "^\\(1\\+\\)", "+1")
+  df$prefix = paste("+", df$prefix, sep = "")
+
+  # Compute grouped ITU numbering plans
+  df = bind_rows(df, buildGroupCodes(idc, 1, "^\\(1\\+\\)", "+1"))
   df = bind_rows(df, buildGroupCodes(idc, 7, "^\\(8\\)", "+78"))
   df = bind_rows(df, buildGroupCodes(idc, 212, "^\\(0\\)", "+212"))
   df = bind_rows(df, buildGroupCodes(idc, 252, NULL, "+252"))
@@ -116,8 +125,10 @@ loadInternationalDiallingCodes <- function()
   df = bind_rows(df, data.frame("operator"="Australia", "prefix"="+61", stringsAsFactors = FALSE))
   df = bind_rows(df, data.frame("operator"="Antartica", "prefix"="+672", stringsAsFactors = FALSE))
   df = bind_rows(df, buildGroupCodes(idc, 90, "^(\\(0\\))?", "+90"))
+  df = bind_rows(df, data.frame("operator"="Kyrgyz Republic", "prefix"="+996", stringsAsFactors = FALSE))
+  df = bind_rows(df, data.frame("operator"="Uzbekistan", "prefix"="+998", stringsAsFactors = FALSE))
   
-  return (mutate(df, "org"="ITU"))
+  return (mutate(df, org="ITU"))
 }
 
 lookupOperator <- function(telNums, operatorTable, isDebug = FALSE)
@@ -141,7 +152,7 @@ lookupOperator <- function(telNums, operatorTable, isDebug = FALSE)
         result = bind_rows(result, moreResults)
       }
       
-      telNums = select(filter(lookup, is.na(lookup$operator)), -c(prefix, operator))
+      telNums = select(filter(lookup, is.na(lookup$operator)), -c(prefix, operator, org))
       if (nrow(telNums) == 0)
         break
     }
@@ -178,24 +189,64 @@ loadPcapData <- function(filename)
   dt$P_Telnum = extractTelNumber(dt$P_Telnum)
   dt$G_Telnum = extractTelNumber(dt$G_Telnum)
   dt$D_Telnum = extractTelNumber(dt$D_Telnum)
-  
-  #dt$N_Prefix = extractPrefix(dt$N_Telnum)
-  #dt$P_Prefix = extractPrefix(dt$P_Telnum)
-  #dt$G_Prefix = extractPrefix(dt$G_Telnum)
-  #dt$D_Prefix = extractPrefix(dt$D_Telnum)
-  
+
   return (tbl_df(dt))
 }
 
-addOperators <- function(df, operatorTable, telNumField, prefixField, opField)
+getNumberMatch <- function(telnumA, prefixA, orgA, telnumB, prefixB, orgB)
 {
-  result = data.frame("id"=df$id, "number"=df[[telNumField]]) %>%
+  if (sum(is.na(c(telnumA, prefixA, orgA, telnumB, prefixB, orgB))) > 0) return (NA)
+  
+  if (telnumA == telnumB) return ("Equal")
+  
+  if (orgA == orgB)
+  {
+    if (orgA == "Ofcom") # & (orgB == "Ofcom")
+    {
+      if (prefixA == prefixB) return ("SameRange")
+      
+      return ("SameCountry")
+    }
+    else # (orgA == "ITU") & (orgB == "ITU")
+    {
+      if (prefixA == prefixB) return ("SameCountry")
+    
+      return ("NotEqual")
+    }
+  }
+  
+  if ((orgA == "Ofcom" & prefixB == "+44") | (orgB == "Ofcom" & prefixA == "+44"))
+    return ("SameCountry")
+  
+  return ("NotEqual")
+}
+  
+
+addNumberMatch <- function(df, prefixA, prefixB)
+{
+  df[[paste(prefixA, prefixB, "_NumMatch", sep = "")]] =
+    mapply(getNumberMatch,
+           df[[paste(prefixA, "_Telnum", sep = "")]],
+           df[[paste(prefixA, "_Prefix", sep = "")]],
+           df[[paste(prefixA, "_Org", sep = "")]],
+           df[[paste(prefixB, "_Telnum", sep = "")]],
+           df[[paste(prefixB, "_Prefix", sep = "")]],
+           df[[paste(prefixB, "_Org", sep = "")]],
+           SIMPLIFY = TRUE) %>% as.factor()
+  
+  return (df)
+}
+
+addOperators <- function(df, operatorTable, prefix)
+{
+  result = data.frame("id"=df$id, "number"=df[[paste(prefix, "_Telnum", sep = "")]]) %>%
     lookupOperator(operatorTable)
 
   if (is.null(result)) return (df)
   
-  names(result) = sub("operator", opField, names(result))
-  names(result) = sub("prefix", prefixField, names(result))
+  names(result) = sub("operator", paste(prefix, "_Op", sep = ""), names(result))
+  names(result) = sub("prefix", paste(prefix, "_Prefix", sep = ""), names(result))
+  names(result) = sub("org", paste(prefix, "_Org", sep = ""), names(result))
   
   return (left_join(df, result, by="id"))
 }
@@ -211,10 +262,14 @@ loadAllPcapData <- function()
   
   opTable = bind_rows(loadAllNumberingPlans(), loadInternationalDiallingCodes())
   
-  df = addOperators(df, opTable, "N_Telnum", "N_Prefix", "N_Op")
-  df = addOperators(df, opTable, "P_Telnum", "P_Prefix", "P_Op")
-  df = addOperators(df, opTable, "G_Telnum", "G_Prefix", "G_Op")
-  df = addOperators(df, opTable, "D_Telnum", "D_Prefix", "D_Op")
+  df = addOperators(df, opTable, "N")
+  df = addOperators(df, opTable, "P")
+  df = addOperators(df, opTable, "G")
+  df = addOperators(df, opTable, "D")
+
+  df = addNumberMatch(df, "N", "P")
+  df = addNumberMatch(df, "N", "G")
+  df = addNumberMatch(df, "G", "P")
   
   return (df)
 }
