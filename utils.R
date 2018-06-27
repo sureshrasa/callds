@@ -2,19 +2,52 @@ loadNumberingPlan <- function(filename)
 {
   library(readxl)
   
-  dt = read_excel(filename)
+  print(filename)
+  dt = read_xlsx(filename, guess_max = 50000)
+  print(names(dt))
+  
+  result = c()
   
   if ('FG' %in% names(dt))
   {
-    dt$prefix = paste("+44", dt$SABC, dt$`D/DE`, dt$FG, sep = "")
+    fgNums = dt[!is.na(dt$FG),]
+    if (nrow(fgNums) > 0)
+    {
+      print(sprintf("FG rows = %d", nrow(fgNums)))
+      fgNums$prefix = paste("+44", fgNums$SABC, fgNums$'D/DE', fgNums$FG, sep = "")
+      result = bind_rows(result, fgNums)
+    }
+    dt = dt[is.na(dt$FG),]
   }
-  else
+    
+  if ('D/DE' %in% names(dt))
   {
-    dt$prefix = paste("+44", dt$SABC, dt$`D/DE`, sep = "")
+    deNums = dt[!is.na(dt$'D/DE'),]
+    if (nrow(deNums) > 0)
+    {
+      print(sprintf("D/DE rows = %d", nrow(deNums)))
+      deNums$prefix = paste("+44", deNums$SABC, deNums$'D/DE', sep = "")
+      result = bind_rows(result, deNums)
+    }
+    dt = dt[is.na(dt$'D/DE'),]
   }
   
-  dt$operator = as.character(dt$`Communications Provider`)
-  return (tbl_df(dt[,c("prefix", "operator")]))
+  if ('SABC' %in% names(dt))
+  {
+    sabcNums = dt[!is.na(dt$SABC),]
+    if (nrow(sabcNums) > 0)
+    {
+      print(sprintf("SABC rows = %d", nrow(sabcNums)))
+      sabcNums$prefix = paste("+44", sabcNums$SABC, sep = "")
+      result = bind_rows(result, sabcNums)
+    }
+    dt = dt[is.na(dt$SABC),]
+  }
+  
+  print(sprintf("Unprocessed rows = %d", nrow(dt)))
+  
+  result$operator = as.character(result$`Communications Provider`)
+  return (mutate(result[,c("prefix", "operator")], "org"="Ofcom"))
 }
 
 loadAllNumberingPlans <- function()
@@ -84,30 +117,39 @@ loadInternationalDiallingCodes <- function()
   df = bind_rows(df, data.frame("operator"="Antartica", "prefix"="+672", stringsAsFactors = FALSE))
   df = bind_rows(df, buildGroupCodes(idc, 90, "^(\\(0\\))?", "+90"))
   
-  return (df)
+  return (mutate(df, "org"="ITU"))
 }
 
-lookupOperator <- function(telNums, operatorTable)
+lookupOperator <- function(telNums, operatorTable, isDebug = FALSE)
 {
   l = str_length(operatorTable$prefix)
   
   result = c()
   for (i in max(l):min(l))
   {
-    lookup = left_join(telNums, operatorTable, by = c("prefix"="prefix"))
+    if (isDebug) print(sprintf("trying prefix: %d", i))
+    
+    i_prefix = telNums %>% mutate(prefix = substr(telNums$number, 1, i))
+    
+    lookup = left_join(i_prefix, operatorTable, by = c("prefix"="prefix"))
     if (nrow(lookup) > 0)
     {
       moreResults = filter(lookup, !is.na(lookup$operator))
       if (nrow(moreResults) > 0)
+      {
+        if (isDebug) print("Found results:")
         result = bind_rows(result, moreResults)
+      }
       
-      telNums = filter(lookup, is.na(lookup$operator))
+      telNums = select(filter(lookup, is.na(lookup$operator)), -c(prefix, operator))
       if (nrow(telNums) == 0)
         break
     }
   }
   
-  return (result)
+  if (is.null(result)) return (NULL)
+  
+  return (select(result, -number))
 }
 
 extractTelNumber <- function(telNums)
@@ -137,29 +179,25 @@ loadPcapData <- function(filename)
   dt$G_Telnum = extractTelNumber(dt$G_Telnum)
   dt$D_Telnum = extractTelNumber(dt$D_Telnum)
   
-  dt$N_Prefix = extractPrefix(dt$N_Telnum)
-  dt$P_Prefix = extractPrefix(dt$P_Telnum)
-  dt$G_Prefix = extractPrefix(dt$G_Telnum)
-  dt$D_Prefix = extractPrefix(dt$D_Telnum)
+  #dt$N_Prefix = extractPrefix(dt$N_Telnum)
+  #dt$P_Prefix = extractPrefix(dt$P_Telnum)
+  #dt$G_Prefix = extractPrefix(dt$G_Telnum)
+  #dt$D_Prefix = extractPrefix(dt$D_Telnum)
   
   return (tbl_df(dt))
 }
 
-addOperators <- function(df, operatorTable)
+addOperators <- function(df, operatorTable, telNumField, prefixField, opField)
 {
-  df = left_join(df, operatorTable, by=c("N_Prefix"="prefix"))
-  df = rename(df, N_Op=operator)
+  result = data.frame("id"=df$id, "number"=df[[telNumField]]) %>%
+    lookupOperator(operatorTable)
+
+  if (is.null(result)) return (df)
   
-  df = left_join(df, operatorTable, by=c("P_Prefix"="prefix"))
-  df = rename(df, P_Op=operator) 
+  names(result) = sub("operator", opField, names(result))
+  names(result) = sub("prefix", prefixField, names(result))
   
-  df = left_join(df, operatorTable, by=c("G_Prefix"="prefix"))
-  df = rename(df, G_Op=operator)
-  
-  df = left_join(df, operatorTable, by=c("D_Prefix"="prefix"))
-  df = rename(df, D_Op=operator)
-  
-  return (df)
+  return (left_join(df, result, by="id"))
 }
 
 loadAllPcapData <- function()
@@ -168,13 +206,15 @@ loadAllPcapData <- function()
   library(tidyr)
   library(stringr)
 
-  df = loadPcapData("~/Downloads/PCAP Trace Files/all_files.csv")
-  all_nums = bind_rows(loadAllNumberingPlans(), loadInternationalDiallingCodes())
+  df = loadPcapData("~/Downloads/PCAP Trace Files/all_files.csv") %>%
+    mutate(id = row_number())
   
-  df$N_Op = sapply(df$N_Telnum, function(x) lookupCountryCode(x, all_nums))
-  df$P_Op = sapply(df$P_Telnum, function(x) lookupCountryCode(x, all_nums))
-  df$G_Op = sapply(df$G_Telnum, function(x) lookupCountryCode(x, all_nums))
-  #df = addOperators(df, all_nums)
+  opTable = bind_rows(loadAllNumberingPlans(), loadInternationalDiallingCodes())
+  
+  df = addOperators(df, opTable, "N_Telnum", "N_Prefix", "N_Op")
+  df = addOperators(df, opTable, "P_Telnum", "P_Prefix", "P_Op")
+  df = addOperators(df, opTable, "G_Telnum", "G_Prefix", "G_Op")
+  df = addOperators(df, opTable, "D_Telnum", "D_Prefix", "D_Op")
   
   return (df)
 }
